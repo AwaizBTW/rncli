@@ -4,6 +4,13 @@ use crate::error::{Error, Result};
 use regex::Regex;
 use std::fs;
 use std::path::Path;
+use once_cell::sync::Lazy;
+
+// Compile regex at module load time (lazy)
+static DOMAIN_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+        .expect("Domain regex is valid")
+});
 
 /// Website blocking manager
 pub struct BlockingManager {
@@ -17,6 +24,12 @@ impl BlockingManager {
             use_sudo,
             hosts_file: "/etc/hosts".to_string(),
         }
+    }
+
+    /// Create with custom hosts file (for testing)
+    #[cfg(test)]
+    pub fn with_hosts_file(use_sudo: bool, hosts_file: String) -> Self {
+        Self { use_sudo, hosts_file }
     }
 
     /// Block a website by domain or URL
@@ -100,8 +113,11 @@ impl BlockingManager {
         let lines: Vec<&str> = content
             .lines()
             .filter(|line| {
-                !line.contains(&format!("127.0.0.1 {}", domain))
-                    || !line.contains("rncli-blocked")
+                // Only remove lines that match BOTH conditions:
+                // 1. Contain the blocked domain marker from rncli
+                // 2. Target the domain we want to unblock
+                !(line.contains(&format!("127.0.0.1 {}", domain))
+                    && line.contains("rncli-blocked"))
             })
             .collect();
 
@@ -119,24 +135,47 @@ impl BlockingManager {
     /// Read hosts file
     fn read_hosts_file(&self) -> Result<String> {
         fs::read_to_string(&self.hosts_file)
-            .map_err(|_| Error::BlockingConfigFailed(
-                "Cannot read /etc/hosts file".to_string(),
+            .map_err(|e| Error::BlockingConfigFailed(
+                format!("Cannot read hosts file: {}", e),
             ))
     }
 
-    /// Write hosts file
+    /// Write hosts file with atomic operation
     fn write_hosts_file(&self, content: &str) -> Result<()> {
-        fs::write(&self.hosts_file, content)
-            .map_err(|_| Error::BlockingConfigFailed(
-                "Cannot write /etc/hosts file. You may need sudo.".to_string(),
-            ))
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Write to temp file first, then rename (atomic operation)
+        let temp_file = NamedTempFile::new()
+            .map_err(|e| Error::BlockingConfigFailed(
+                format!("Cannot create temporary file: {}", e),
+            ))?;
+
+        let mut file = temp_file;
+        file.write_all(content.as_bytes())
+            .map_err(|e| Error::BlockingConfigFailed(
+                format!("Cannot write to temporary file: {}", e),
+            ))?;
+
+        file.persist(&self.hosts_file)
+            .map_err(|e| Error::BlockingConfigFailed(
+                format!("Cannot write hosts file. Requires elevated privileges. Error: {}", e),
+            ))?;
+
+        Ok(())
     }
 }
 
-/// Extract domain from URL or domain string
+/// Extract domain from URL or domain string with validation
 fn extract_domain(domain_or_url: &str) -> Result<String> {
+    // Validate input length
+    if domain_or_url.is_empty() || domain_or_url.len() > 255 {
+        return Err(Error::InvalidInput("Domain must be between 1 and 255 characters".to_string()));
+    }
+
     // Remove protocol if present
     let domain = domain_or_url
+        .trim()
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .trim_start_matches("ftp://");
@@ -153,15 +192,15 @@ fn extract_domain(domain_or_url: &str) -> Result<String> {
     // Remove port if present
     let domain = domain.split(':').next().unwrap_or("");
 
-    // Validate domain format
-    let domain_regex = Regex::new(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-        .unwrap();
+    // Trim whitespace
+    let domain = domain.trim();
 
-    if domain_regex.is_match(&domain.to_lowercase()) {
+    // Validate domain format using pre-compiled regex
+    if DOMAIN_REGEX.is_match(&domain.to_lowercase()) {
         Ok(domain.to_string())
     } else {
         Err(Error::InvalidInput(format!(
-            "'{}' is not a valid domain",
+            "'{}' is not a valid domain (must be valid DNS name)",
             domain
         )))
     }
@@ -191,6 +230,21 @@ mod tests {
     fn test_extract_domain_invalid() {
         assert!(extract_domain("").is_err());
         assert!(extract_domain("invalid..domain").is_err());
+        assert!(extract_domain("192.168.1.1").is_err()); // IP addresses not allowed
+    }
+
+    #[test]
+    fn test_extract_domain_with_whitespace() {
+        assert_eq!(
+            extract_domain("  example.com  ").unwrap(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_domain_too_long() {
+        let long_domain = "a".repeat(256);
+        assert!(extract_domain(&long_domain).is_err());
     }
 
     #[test]
